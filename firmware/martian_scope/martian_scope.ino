@@ -6,15 +6,27 @@
 #define LED                   5
 #define TX_BUFFER_SIZE 1024
 #define RX_BUFFER_SIZE 16
+#define DATA_BUFFER_SIZE 64
 
 // State
 #define CHECK 0x01
 #define OPERATE 0x02
 
 // Command
-#define CMD_READ  0x10
+#define CMD_WRITE   0x10
+#define CMD_READ    0x11
+
+// Response
+#define ACK             0x01
+
+#define NAK             0x80
+#define NO_DATA         0x01
+#define PREAMBLE_ERROR  0x02
+#define CHECKSUM_ERROR  0x04
+
 
 uint8_t state;
+uint8_t result;
 volatile uint16_t   tx_head;
 volatile uint16_t   tx_tail;
 volatile uint16_t   tx_count;
@@ -28,7 +40,9 @@ volatile uint8_t    rx_buffer[RX_BUFFER_SIZE];
 volatile uint8_t    sampleCount = 1;
 volatile uint16_t   tmr2Tick;
 
-uint8_t cmd, data;
+uint8_t cmd, len;
+uint8_t *data;
+uint8_t dataBuffer[DATA_BUFFER_SIZE];
 
 ISR(ANALOG_COMP_vect){
   PORTB   |=  (1<<COMP_PROBE);
@@ -88,16 +102,27 @@ ISR(USART_RX_vect){
 }
 
 void writeTxBuffer(uint8_t data){
-  tx_buffer[tx_head] = data;
-  tx_head = (tx_head + 1) % TX_BUFFER_SIZE;
-  tx_count++;
+  if(tx_count < TX_BUFFER_SIZE){
+    tx_buffer[tx_head] = data;
+    tx_head = (tx_head + 1) % TX_BUFFER_SIZE;
+    tx_count++;
+  }
 }
 
 uint8_t readTxBuffer(){
-  uint8_t val = tx_buffer[tx_tail];
-  tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
-  tx_count--;
+  uint8_t val;
+  if(tx_count > 0){
+    val = tx_buffer[tx_tail];
+    tx_tail = (tx_tail + 1) % TX_BUFFER_SIZE;
+    tx_count--;
+  }
   return val;
+}
+
+void flushTxBuffer(){
+  tx_head       = 0;
+  tx_tail       = 0;
+  tx_count      = 0;
 }
 
 void writeRxBuffer(uint8_t data){
@@ -160,32 +185,60 @@ void setup() {
   sei();
 }
 
-boolean isPackageValid(){
-  if(rx_count > 0){
-    if(readRxBuffer() == 0xAA){
-      return true;
-    }
+void startSendPacket(){
+  if(tx_count > 0){
+    UDR0 = readTxBuffer();
   }
-  return false;
+}
+
+void sendPacket(uint8_t result, uint8_t len, uint8_t *data){
+  // write data into FIFO
+  writeTxBuffer(0xAA); // preamble
+  writeTxBuffer(10); // len
+  for(uint8_t i = 0; i < 10; i++){
+    writeTxBuffer(i);
+  }
+  // send first byte, next byte will be sent by ISR
+  startSendPacket();
+}
+
+uint8_t isValidPacket(){
+  if(rx_count > 0){
+    if(readRxBuffer() != 0xAA){
+      return NAK | PREAMBLE_ERROR;
+    }
+    return ACK;
+  }
+  return NAK;
 }
 
 void loop() {
     switch(state){
       case CHECK:
-        if(isPackageValid()){
+        result = isValidPacket();
+        if(result == ACK){
           cmd = readRxBuffer();
+//          len = readRxBuffer();
           state = OPERATE;
         }
         break;
+      ////////////////////////////////////////////////////////////////////////  
       case OPERATE: 
         switch(cmd){
-          case CMD_READ:
+          case CMD_WRITE:
             PORTB &= ~(1<<LED);
             PORTB |= (readRxBuffer()<<LED);
+            for(uint8_t i = 0; i < 10; i++){
+              dataBuffer[i] = i+1;
+            }
+            sendPacket(ACK, 10, &dataBuffer[0]);
+            break;
+          case CMD_READ:
             break;
         }
         state = CHECK;
         break;
+      //////////////////////////////////////////////////  
       default:
         state = CHECK;
         break;
